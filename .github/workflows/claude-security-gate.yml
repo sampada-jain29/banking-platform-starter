@@ -198,31 +198,29 @@ jobs:
           
           Respond with ONLY valid JSON, no other text."
           
-          # Run Claude Code in headless mode with stream-json output
+          # Run Claude Code in headless mode with json output
           claude \
             --model claude-haiku-4-5 \
-            --output-format stream-json \
+            --output-format json \
             -p "$PCI_PROMPT" \
             2>/dev/null \
             | python3 -c "
           import sys, json
 
-          # Parse stream-json events to extract the final text content
+          # Parse json output: extract result field then parse embedded JSON
+          raw = sys.stdin.read().strip()
           result_text = ''
-          for line in sys.stdin:
-              line = line.strip()
-              if not line:
-                  continue
-              try:
-                  event = json.loads(line)
-                  # Extract content from stream events
-                  if event.get('type') == 'content_block_delta':
-                      delta = event.get('delta', {})
-                      if delta.get('type') == 'text_delta':
-                          result_text += delta.get('text', '')
-              except json.JSONDecodeError:
-                  continue
+          try:
+              outer = json.loads(raw)
+              # Current Claude Code json format: {type: result, result: '...'}
+              result_text = outer.get('result', '')
+          except json.JSONDecodeError:
+              result_text = raw
 
+          # Strip markdown code fences if present
+          import re
+          result_text = re.sub(r'^```(?:json)?\s*', '', result_text.strip())
+          result_text = re.sub(r'\s*```$', '', result_text.strip())
           print(result_text)
           " > ci_reports/claude_pci_analysis.json 2>/dev/null || echo '{"overall_pci_status": "ERROR", "critical_high_count": 0, "summary": "Claude Code analysis failed"}' > ci_reports/claude_pci_analysis.json
           
@@ -351,89 +349,81 @@ jobs:
         id: compliance-judge
         run: |
           mkdir -p ci_reports
-          
-          # The Claude-as-Judge rubric for BFSI banking platform compliance
-          JUDGE_PROMPT="You are a senior banking compliance officer acting as a code review judge.
-          
+
+          # Write the diff summary to a temp file (avoids bash variable quoting issues)
+          head -400 ci_reports/full_diff.patch > /tmp/diff_excerpt.txt
+          DIFF_EXCERPT=$(cat /tmp/diff_excerpt.txt)
+
+          # Write prompt to file to avoid bash special-character expansion in -p arg
+          cat > /tmp/judge_prompt.txt << 'PROMPT_EOF'
+          You are a senior banking compliance officer acting as a code review judge.
+
           Score this pull request on a 1-5 compliance quality rubric for a PCI DSS-regulated banking platform.
-          
+
           SCORING RUBRIC:
-          
-          5/5 - EXCELLENT:
-          - All sensitive data properly masked/encrypted
-          - Complete audit logging for all financial operations  
-          - Input validation on all user-provided data
-          - No hardcoded credentials or secrets
-          - Proper error handling without information leakage
-          - Code follows all CLAUDE.md PCI DSS standards
-          
-          4/5 - GOOD (MEETS GATE THRESHOLD):
-          - Sensitive data handling is correct
-          - Audit logging present for key operations
-          - Minor improvements possible but no compliance risks
-          - Follows most PCI DSS standards from CLAUDE.md
-          
-          3/5 - ADEQUATE (BELOW THRESHOLD — GATE FAILS):
-          - Some gaps in data protection
-          - Incomplete audit trail
-          - Some missing input validation
-          - Needs remediation before merging
-          
-          2/5 - POOR (GATE FAILS):
-          - Significant compliance gaps
-          - Missing required security controls
-          - High risk of PCI DSS violation in production
-          
-          1/5 - CRITICAL FAILURE (GATE FAILS):
-          - Active PCI DSS violations
-          - Data exposed or security controls bypassed
-          - Must not be merged under any circumstances
-          
-          PULL REQUEST METADATA:
-          - PR #${{ github.event.pull_request.number }}
-          - Title: ${{ github.event.pull_request.title }}
-          - Author: ${{ github.event.pull_request.user.login }}
-          
-          CODE CHANGES TO REVIEW:
-          $(cat ci_reports/full_diff.patch | head -400)
-          
+          5 - EXCELLENT: all sensitive data masked, complete audit logging, input validation everywhere, no hardcoded secrets, safe error handling
+          4 - GOOD (MEETS GATE THRESHOLD): correct data handling, audit logging present, minor improvements possible, no compliance risks
+          3 - ADEQUATE (BELOW THRESHOLD): some gaps in data protection, incomplete audit trail, missing input validation
+          2 - POOR (GATE FAILS): significant compliance gaps, missing required security controls
+          1 - CRITICAL FAILURE (GATE FAILS): active PCI DSS violations, data exposed
+
           Respond with ONLY this JSON structure, no other text:
-          {
-            \"score\": <integer 1-5>,
-            \"grade\": \"EXCELLENT|GOOD|ADEQUATE|POOR|CRITICAL_FAILURE\",
-            \"gate_decision\": \"PASS|FAIL\",
-            \"strengths\": [\"strength 1\", \"strength 2\"],
-            \"improvements_required\": [\"improvement 1\"],
-            \"improvements_suggested\": [\"suggestion 1\"],
-            \"pci_dss_notes\": \"Brief note on PCI DSS compliance\",
-            \"reviewer_summary\": \"2-3 sentence summary for PR author\"
-          }"
-          
-          # Run Claude-as-Judge in headless mode
+          {"score": <integer 1-5>, "grade": "EXCELLENT|GOOD|ADEQUATE|POOR|CRITICAL_FAILURE", "gate_decision": "PASS|FAIL", "strengths": ["s1"], "improvements_required": [], "improvements_suggested": [], "pci_dss_notes": "brief note", "reviewer_summary": "2-3 sentence summary"}
+          PROMPT_EOF
+
+          # Append diff
+          echo "" >> /tmp/judge_prompt.txt
+          echo "CODE CHANGES TO REVIEW:" >> /tmp/judge_prompt.txt
+          cat /tmp/diff_excerpt.txt >> /tmp/judge_prompt.txt
+
+          # Run Claude-as-Judge — capture raw output to file for robust parsing
           claude \
             --model claude-sonnet-4-5 \
-            --output-format stream-json \
-            -p "$JUDGE_PROMPT" \
-            2>/dev/null \
-            | python3 -c "
-          import sys, json
+            --output-format json \
+            -p "$(cat /tmp/judge_prompt.txt)" \
+            > /tmp/claude_raw.json 2>/tmp/claude_err.txt || true
 
-          result_text = ''
-          for line in sys.stdin:
-              line = line.strip()
-              if not line:
-                  continue
+          # Parse output with Python — always writes valid JSON to compliance_score.json
+          python3 << 'PYEOF'
+          import sys, json, re
+
+          FALLBACK = {"score": 0, "grade": "ERROR", "gate_decision": "FAIL",
+                      "strengths": [], "improvements_required": [],
+                      "improvements_suggested": [], "pci_dss_notes": "",
+                      "reviewer_summary": "Scoring failed — manual review required"}
+
+          def write(obj):
+              with open("ci_reports/compliance_score.json", "w") as f:
+                  json.dump(obj, f)
+
+          try:
+              raw = open("/tmp/claude_raw.json").read().strip()
+              if not raw:
+                  write(FALLBACK)
+                  sys.exit(0)
+              # Current Claude Code json output: {"type":"result","result":"..."}
               try:
-                  event = json.loads(line)
-                  if event.get('type') == 'content_block_delta':
-                      delta = event.get('delta', {})
-                      if delta.get('type') == 'text_delta':
-                          result_text += delta.get('text', '')
+                  outer = json.loads(raw)
+                  result_text = outer.get("result", raw)
               except json.JSONDecodeError:
-                  continue
-          print(result_text)
-          " > ci_reports/compliance_score.json 2>/dev/null \
-            || echo '{\"score\": 0, \"grade\": \"ERROR\", \"gate_decision\": \"FAIL\", \"reviewer_summary\": \"Scoring failed — manual review required\"}' > ci_reports/compliance_score.json
+                  result_text = raw
+              # Strip markdown fences
+              result_text = re.sub(r"^```(?:json)?\s*", "", result_text.strip())
+              result_text = re.sub(r"\s*```\s*$", "", result_text.strip())
+              # Find first JSON object
+              m = re.search(r"\{.*\}", result_text, re.DOTALL)
+              result_text = m.group(0) if m else result_text
+              parsed = json.loads(result_text)
+              # Ensure required fields exist with sensible defaults
+              parsed.setdefault("score", 0)
+              parsed.setdefault("grade", "UNKNOWN")
+              parsed.setdefault("gate_decision", "FAIL")
+              write(parsed)
+          except Exception as e:
+              fb = dict(FALLBACK)
+              fb["reviewer_summary"] = f"Parse error: {e}"
+              write(fb)
+          PYEOF
           
           # Extract score and decision
           SCORE=$(python3 -c "
