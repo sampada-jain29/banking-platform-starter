@@ -198,31 +198,29 @@ jobs:
           
           Respond with ONLY valid JSON, no other text."
           
-          # Run Claude Code in headless mode with stream-json output
+          # Run Claude Code in headless mode with json output
           claude \
             --model claude-haiku-4-5 \
-            --output-format stream-json \
+            --output-format json \
             -p "$PCI_PROMPT" \
             2>/dev/null \
             | python3 -c "
           import sys, json
 
-          # Parse stream-json events to extract the final text content
+          # Parse json output: extract result field then parse embedded JSON
+          raw = sys.stdin.read().strip()
           result_text = ''
-          for line in sys.stdin:
-              line = line.strip()
-              if not line:
-                  continue
-              try:
-                  event = json.loads(line)
-                  # Extract content from stream events
-                  if event.get('type') == 'content_block_delta':
-                      delta = event.get('delta', {})
-                      if delta.get('type') == 'text_delta':
-                          result_text += delta.get('text', '')
-              except json.JSONDecodeError:
-                  continue
+          try:
+              outer = json.loads(raw)
+              # Current Claude Code json format: {type: result, result: '...'}
+              result_text = outer.get('result', '')
+          except json.JSONDecodeError:
+              result_text = raw
 
+          # Strip markdown code fences if present
+          import re
+          result_text = re.sub(r'^```(?:json)?\s*', '', result_text.strip())
+          result_text = re.sub(r'\s*```$', '', result_text.strip())
           print(result_text)
           " > ci_reports/claude_pci_analysis.json 2>/dev/null || echo '{"overall_pci_status": "ERROR", "critical_high_count": 0, "summary": "Claude Code analysis failed"}' > ci_reports/claude_pci_analysis.json
           
@@ -412,28 +410,31 @@ jobs:
           # Run Claude-as-Judge in headless mode
           claude \
             --model claude-sonnet-4-5 \
-            --output-format stream-json \
+            --output-format json \
             -p "$JUDGE_PROMPT" \
             2>/dev/null \
             | python3 -c "
-          import sys, json
+          import sys, json, re
 
+          raw = sys.stdin.read().strip()
           result_text = ''
-          for line in sys.stdin:
-              line = line.strip()
-              if not line:
-                  continue
-              try:
-                  event = json.loads(line)
-                  if event.get('type') == 'content_block_delta':
-                      delta = event.get('delta', {})
-                      if delta.get('type') == 'text_delta':
-                          result_text += delta.get('text', '')
-              except json.JSONDecodeError:
-                  continue
+          try:
+              outer = json.loads(raw)
+              # Current Claude Code json format: {type: result, result: '...'}
+              result_text = outer.get('result', '')
+          except json.JSONDecodeError:
+              result_text = raw
+
+          # Strip markdown code fences if present
+          result_text = re.sub(r'^.*?```(?:json)?\s*', '', result_text.strip(), flags=re.DOTALL)
+          result_text = re.sub(r'\s*```.*$', '', result_text.strip(), flags=re.DOTALL)
+          # Find the first JSON object in the result
+          m = re.search(r'\{.*\}', result_text, re.DOTALL)
+          if m:
+              result_text = m.group(0)
           print(result_text)
           " > ci_reports/compliance_score.json 2>/dev/null \
-            || echo '{\"score\": 0, \"grade\": \"ERROR\", \"gate_decision\": \"FAIL\", \"reviewer_summary\": \"Scoring failed — manual review required\"}' > ci_reports/compliance_score.json
+            || echo '{"score": 0, "grade": "ERROR", "gate_decision": "FAIL", "reviewer_summary": "Scoring failed — manual review required"}' > ci_reports/compliance_score.json
           
           # Extract score and decision
           SCORE=$(python3 -c "
